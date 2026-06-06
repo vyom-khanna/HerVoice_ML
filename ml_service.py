@@ -24,6 +24,7 @@ from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
 from sklearn.preprocessing import LabelEncoder, MultiLabelBinarizer
 from xgboost import XGBRegressor
+from scipy.spatial import KDTree
 
 warnings.filterwarnings("ignore")
 
@@ -36,11 +37,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-RESOURCES_DIR    = Path("resources")
-MODEL_PATH       = RESOURCES_DIR / "trained_model.pkl"
-LABEL_ENC_PATH   = RESOURCES_DIR / "label_encoder.pkl"
-TAG_BIN_PATH     = RESOURCES_DIR / "tag_binarizer.pkl"
-FEAT_COLS_PATH   = RESOURCES_DIR / "feature_columns.pkl"
+RESOURCES_DIR      = Path(__file__).resolve().parent / "resources"
+MODEL_PATH         = RESOURCES_DIR / "trained_model.pkl"
+LABEL_ENC_PATH     = RESOURCES_DIR / "label_encoder.pkl"
+TAG_BIN_PATH       = RESOURCES_DIR / "tag_binarizer.pkl"
+FEAT_COLS_PATH     = RESOURCES_DIR / "feature_columns.pkl"
+SPATIAL_REF_PATH   = RESOURCES_DIR / "spatial_reference.pkl"
 
 RESOURCES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -150,14 +152,83 @@ def _extract_temporal(series: pd.Series) -> pd.DataFrame:
     )
 
 
+def _compute_knn_features(
+    coords: np.ndarray,
+    fit: bool,
+    spatial_ref: Optional[dict] = None,
+    current_ratings: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute KNN-style spatial features:
+      - mean_neighbor_safety (average safety rating of the 5 nearest neighbors)
+      - dist_to_nearest_incident (distance to the closest rating <= 2.0)
+    """
+    if fit:
+        ref_coords = coords
+        ref_ratings = current_ratings if current_ratings is not None else np.full(len(coords), 3.0)
+        incident_mask = ref_ratings <= 2.0
+        incident_coords = ref_coords[incident_mask]
+    else:
+        if spatial_ref is None:
+            return np.full(len(coords), 3.0), np.full(len(coords), 10.0)
+        ref_coords = spatial_ref["coords"]
+        ref_ratings = spatial_ref["ratings"]
+        incident_coords = spatial_ref["incident_coords"]
+
+    # ── 1. Mean Neighbor Safety (k=5 neighbors) ──
+    tree = KDTree(ref_coords)
+    if fit:
+        k_query = min(6, len(ref_coords))
+        dists, indices = tree.query(coords, k=k_query)
+        if indices.ndim == 1:
+            indices = indices[:, np.newaxis]
+        # Skip the first column (self representation)
+        neighbor_indices = indices[:, 1:] if indices.shape[1] > 1 else indices
+        mean_safety = np.mean(ref_ratings[neighbor_indices], axis=1)
+    else:
+        k_query = min(5, len(ref_coords))
+        dists, indices = tree.query(coords, k=k_query)
+        if indices.ndim == 1:
+            indices = indices[:, np.newaxis]
+        mean_safety = np.mean(ref_ratings[indices], axis=1)
+
+    # ── 2. Distance to Nearest Incident ──
+    if len(incident_coords) == 0:
+        dist_to_incident = np.full(len(coords), 10.0)
+    else:
+        inc_tree = KDTree(incident_coords)
+        if fit:
+            dists, indices = inc_tree.query(coords, k=min(2, len(incident_coords)))
+            if dists.ndim == 1:
+                dists = dists[:, np.newaxis]
+            dist_to_incident = []
+            for i in range(len(coords)):
+                # If the point itself is an incident, distance is ~0, so take the 2nd closest
+                if dists[i, 0] < 1e-7 and dists.shape[1] > 1:
+                    dist_to_incident.append(dists[i, 1])
+                else:
+                    dist_to_incident.append(dists[i, 0])
+            dist_to_incident = np.array(dist_to_incident)
+        else:
+            dists, indices = inc_tree.query(coords, k=1)
+            dist_to_incident = dists
+
+    # Clean up NaNs / infs
+    mean_safety = np.nan_to_num(mean_safety, nan=3.0)
+    dist_to_incident = np.nan_to_num(dist_to_incident, nan=10.0)
+
+    return mean_safety, dist_to_incident
+
+
 def build_features(
     df: pd.DataFrame,
     mlb: Optional[MultiLabelBinarizer] = None,
     le:  Optional[LabelEncoder]        = None,
     fit: bool = True,
+    spatial_ref: Optional[dict] = None,
 ) -> tuple[pd.DataFrame, MultiLabelBinarizer, LabelEncoder]:
     """
-    Full feature engineering pipeline.
+    Full feature engineering pipeline with KNN-style spatial features.
 
     Returns
     -------
@@ -172,6 +243,16 @@ def build_features(
     spatial_df["latitude"]  = pd.to_numeric(spatial_df["latitude"],  errors="coerce").fillna(0.0)
     spatial_df["longitude"] = pd.to_numeric(spatial_df["longitude"], errors="coerce").fillna(0.0)
 
+    # ── KNN-style Spatial Neighborhood Features ──
+    coords = spatial_df[["latitude", "longitude"]].values
+    current_ratings = df[TARGET_COL].values if (fit and TARGET_COL in df.columns) else None
+    
+    mean_safety, dist_to_incident = _compute_knn_features(
+        coords, fit=fit, spatial_ref=spatial_ref, current_ratings=current_ratings
+    )
+    spatial_df["mean_neighbor_safety"] = mean_safety
+    spatial_df["dist_to_nearest_incident"] = dist_to_incident
+
     # ── 2. Tags ────────────────────────────────────────────────────────────────
     tag_df, mlb = _encode_tags(df.get("tags", pd.Series([""] * len(df), index=df.index)), mlb=mlb, fit=fit)
 
@@ -184,12 +265,10 @@ def build_features(
     temporal_df = _extract_temporal(time_col)
 
     # ── 5. time_context (raw hour 0-23, present in HerVoice CSV) ───────────────────
-    # Overrides the hour extracted from created_at when available, as it is
-    # more reliable (directly recorded vs. parsed from timestamp).
     if "time_context" in df.columns:
         tc = pd.to_numeric(df["time_context"], errors="coerce").fillna(0).astype(int)
-        temporal_df["hour"] = tc.values          # replace parsed hour with direct value
-        temporal_df["time_context"] = tc.values  # also keep as its own feature
+        temporal_df["hour"] = tc.values
+        temporal_df["time_context"] = tc.values
 
     # ── Combine ────────────────────────────────────────────────────────────────────────────
     X = pd.concat([spatial_df, tag_df, grid_encoded, temporal_df], axis=1)
@@ -294,18 +373,20 @@ def save_artifacts(
     le: LabelEncoder,
     mlb: MultiLabelBinarizer,
     feature_columns: list[str],
+    spatial_ref: dict,
 ) -> None:
     """Persist all model artifacts to disk using joblib."""
-    joblib.dump(model,          MODEL_PATH,     compress=3)
-    joblib.dump(le,             LABEL_ENC_PATH, compress=3)
-    joblib.dump(mlb,            TAG_BIN_PATH,   compress=3)
-    joblib.dump(feature_columns, FEAT_COLS_PATH, compress=3)
+    joblib.dump(model,          MODEL_PATH,       compress=3)
+    joblib.dump(le,             LABEL_ENC_PATH,   compress=3)
+    joblib.dump(mlb,            TAG_BIN_PATH,     compress=3)
+    joblib.dump(feature_columns, FEAT_COLS_PATH,   compress=3)
+    joblib.dump(spatial_ref,     SPATIAL_REF_PATH, compress=3)
     logger.info("Artifacts saved → %s", RESOURCES_DIR)
 
 
-def load_artifacts() -> tuple[XGBRegressor, LabelEncoder, MultiLabelBinarizer, list[str]]:
+def load_artifacts() -> tuple[XGBRegressor, LabelEncoder, MultiLabelBinarizer, list[str], dict]:
     """Load all saved artifacts. Raises FileNotFoundError if any are missing."""
-    for p in (MODEL_PATH, LABEL_ENC_PATH, TAG_BIN_PATH, FEAT_COLS_PATH):
+    for p in (MODEL_PATH, LABEL_ENC_PATH, TAG_BIN_PATH, FEAT_COLS_PATH, SPATIAL_REF_PATH):
         if not p.exists():
             raise FileNotFoundError(f"Missing artifact: {p}. Run training first.")
 
@@ -313,8 +394,9 @@ def load_artifacts() -> tuple[XGBRegressor, LabelEncoder, MultiLabelBinarizer, l
     le              = joblib.load(LABEL_ENC_PATH)
     mlb             = joblib.load(TAG_BIN_PATH)
     feature_columns = joblib.load(FEAT_COLS_PATH)
+    spatial_ref     = joblib.load(SPATIAL_REF_PATH)
     logger.info("Artifacts loaded from %s ✓", RESOURCES_DIR)
-    return model, le, mlb, feature_columns
+    return model, le, mlb, feature_columns, spatial_ref
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -360,6 +442,13 @@ def train(csv_path: str = CSV_PATH) -> dict:
     if len(df) < before:
         logger.warning("Dropped %d rows with null target.", before - len(df))
 
+    # Construct spatial reference dictionary for inference
+    spatial_ref = {
+        "coords": df[["latitude", "longitude"]].values,
+        "ratings": df[TARGET_COL].values,
+        "incident_coords": df.loc[df[TARGET_COL] <= 2.0, ["latitude", "longitude"]].values
+    }
+
     # ── Feature engineering ────────────────────────────────────────────────────
     logger.info("Engineering features…")
     X, mlb, le = build_features(df, fit=True)
@@ -399,7 +488,7 @@ def train(csv_path: str = CSV_PATH) -> dict:
     print_feature_importance(model, feature_columns, top_n=20)
 
     # ── Persist ───────────────────────────────────────────────────────────────
-    save_artifacts(model, le, mlb, feature_columns)
+    save_artifacts(model, le, mlb, feature_columns, spatial_ref)
 
     return {
         "train": train_metrics,
@@ -439,7 +528,7 @@ def predict_safety(
             Returns FALLBACK_SCORE if artifacts cannot be loaded.
     """
     try:
-        model, le, mlb, feature_columns = load_artifacts()
+        model, le, mlb, feature_columns, spatial_ref = load_artifacts()
     except FileNotFoundError as exc:
         logger.warning("predict_safety fallback (%s); returning %.1f", exc, FALLBACK_SCORE)
         return FALLBACK_SCORE
@@ -455,7 +544,7 @@ def predict_safety(
     }])
 
     # Apply identical feature engineering (fit=False → use saved encoders)
-    X, _, _ = build_features(row, mlb=mlb, le=le, fit=False)
+    X, _, _ = build_features(row, mlb=mlb, le=le, fit=False, spatial_ref=spatial_ref)
 
     # Align columns to the training schema (fill unseen cols with 0)
     X = X.reindex(columns=feature_columns, fill_value=0)
@@ -482,6 +571,7 @@ class SafetyPredictor:
         self._le:      Optional[LabelEncoder]         = None
         self._mlb:     Optional[MultiLabelBinarizer]  = None
         self._feat_cols: Optional[list[str]]          = None
+        self._spatial_ref: Optional[dict]             = None
         self._is_ready: bool = False
 
     @property
@@ -491,7 +581,7 @@ class SafetyPredictor:
     def load(self) -> bool:
         """Attempt to load pre-trained artifacts from disk."""
         try:
-            self._model, self._le, self._mlb, self._feat_cols = load_artifacts()
+            self._model, self._le, self._mlb, self._feat_cols, self._spatial_ref = load_artifacts()
             self._is_ready = True
             return True
         except FileNotFoundError:
@@ -503,7 +593,7 @@ class SafetyPredictor:
         """Train the model and cache artifacts in memory."""
         metrics = train(csv_path)
         # Reload freshly saved artifacts into instance state
-        self._model, self._le, self._mlb, self._feat_cols = load_artifacts()
+        self._model, self._le, self._mlb, self._feat_cols, self._spatial_ref = load_artifacts()
         self._is_ready = True
         return metrics
 
@@ -527,7 +617,7 @@ class SafetyPredictor:
             "created_at":   created_at,
             "time_context": time_context,
         }])
-        X, _, _ = build_features(row, mlb=self._mlb, le=self._le, fit=False)
+        X, _, _ = build_features(row, mlb=self._mlb, le=self._le, fit=False, spatial_ref=self._spatial_ref)
         X = X.reindex(columns=self._feat_cols, fill_value=0)
         raw = float(self._model.predict(X)[0])
         return round(float(np.clip(raw, 1.0, 5.0)), 3)
@@ -543,7 +633,7 @@ class SafetyPredictor:
             return [FALLBACK_SCORE] * len(records)
 
         df_batch = pd.DataFrame(records)
-        X, _, _  = build_features(df_batch, mlb=self._mlb, le=self._le, fit=False)
+        X, _, _  = build_features(df_batch, mlb=self._mlb, le=self._le, fit=False, spatial_ref=self._spatial_ref)
         X        = X.reindex(columns=self._feat_cols, fill_value=0)
         raws     = self._model.predict(X)
         return [round(float(np.clip(v, 1.0, 5.0)), 3) for v in raws]
