@@ -365,10 +365,14 @@ async def trigger_training(db: AsyncSession = Depends(get_db)):
     """
     res = await db.execute(
         text("""
-            SELECT lat, lng, time_context, safety_rating
-            FROM ratings
-            WHERE safety_rating BETWEEN 1 AND 5
-              AND time_context ~ '^[0-9]+$'
+            SELECT r.lat, r.lng, r.time_context, r.safety_rating, r.created_at,
+                   COALESCE(string_agg(t.name, ','), '') AS tags
+            FROM ratings r
+            LEFT JOIN rating_tags rt ON r.id = rt.rating_id
+            LEFT JOIN tags t ON rt.tag_id = t.id
+            WHERE r.safety_rating BETWEEN 1 AND 5
+              AND r.time_context ~ '^[0-9]+$'
+            GROUP BY r.id, r.lat, r.lng, r.time_context, r.safety_rating, r.created_at
         """)
     )
     rows = res.fetchall()
@@ -380,7 +384,7 @@ async def trigger_training(db: AsyncSession = Depends(get_db)):
         )
 
     import pandas as pd
-    df = pd.DataFrame(rows, columns=["lat", "lng", "time_context", "safety_rating"])
+    df = pd.DataFrame(rows, columns=["lat", "lng", "time_context", "safety_rating", "created_at", "tags"])
 
     try:
         metrics = safety_predictor.train(df)

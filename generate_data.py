@@ -20,7 +20,7 @@ np.random.seed(42)
 # ── Configuration ──────────────────────────────────────────────────────────────
 NUM_RATINGS      = 20_000
 NUM_DEVICES      = 500
-OUTPUT_FILE      = "hervoice_ml_training_data.csv"
+OUTPUT_FILE      = "hervoice_ml_training_data_12.csv"
 DAYS_HISTORY     = 90       # ratings spread over last 90 days
 
 # ── Simulated safety zones (lat, lng, zone_label, base_safety) ─────────────────
@@ -32,7 +32,7 @@ ZONES = [
 
 # ── Common safety tags per rating level ────────────────────────────────────────
 TAGS_BY_LEVEL = {
-    1: ["dark_street", "no_people", "felt_followed", "isolated", "poor_lighting"],
+    1: ["dark_street", "no_people", "felt_followed", "isolated", "poor_lighting", "assault_reported", "harassment_reported"],
     2: ["sparse_crowd", "dimly_lit", "suspicious_activity", "no_cctv"],
     3: ["moderate_crowd", "some_lighting", "mixed_vibes", "ok_transport"],
     4: ["well_lit", "crowded", "cctv_present", "police_nearby", "busy_market"],
@@ -89,14 +89,44 @@ for i in range(NUM_RATINGS):
     created_at = now - timedelta(days=days_ago)
     hour       = created_at.hour
 
-    # Safety rating: zone base + temporal modifier, clipped to [1, 5]
-    raw_score      = zone["base_safety"] + temporal_safety_modifier(hour) + random.uniform(-0.5, 0.5)
-    safety_rating  = int(max(1, min(5, round(raw_score))))
+    # 1. Environment Safety Score (simulated baseline condition)
+    env_safety = zone["base_safety"] + temporal_safety_modifier(hour) + random.uniform(-0.5, 0.5)
 
-    # Tags: 1–3 tags drawn from appropriate level, ±1 level for realism
-    tag_level = max(1, min(5, safety_rating + random.choice([-1, 0, 0, 1])))
-    num_tags  = random.randint(1, 3)
-    tags      = random.sample(TAGS_BY_LEVEL[tag_level], min(num_tags, len(TAGS_BY_LEVEL[tag_level])))
+    # 2. Probability of selecting tags based on baseline environment safety
+    def get_level_probability(level: int, env_score: float) -> float:
+        dist = abs(level - env_score)
+        return math.exp(-(dist ** 2) / 1.5)
+
+    sampled_tags = []
+    levels = list(range(1, 6))
+    random.shuffle(levels)
+    for lvl in levels:
+        level_prob = get_level_probability(lvl, env_safety)
+        if random.random() < level_prob * 0.7:
+            tag_options = TAGS_BY_LEVEL[lvl]
+            sampled_tags.append(random.choice(tag_options))
+
+    sampled_tags = list(set(sampled_tags))
+    if not sampled_tags:
+        sampled_tags = [random.choice(TAGS_BY_LEVEL[3])]
+    else:
+        num_tags = random.randint(1, 3)
+        sampled_tags = sampled_tags[:num_tags]
+
+    # 3. Calculate final safety rating based on environment safety AND sampled tags
+    tag_modifier = 0.0
+    for tag in sampled_tags:
+        if tag in TAGS_BY_LEVEL[1]:
+            tag_modifier += random.uniform(-0.5, -0.2)
+        elif tag in TAGS_BY_LEVEL[2]:
+            tag_modifier += random.uniform(-0.3, -0.1)
+        elif tag in TAGS_BY_LEVEL[4]:
+            tag_modifier += random.uniform(0.1, 0.3)
+        elif tag in TAGS_BY_LEVEL[5]:
+            tag_modifier += random.uniform(0.2, 0.5)
+
+    final_score = env_safety + tag_modifier + random.uniform(-0.2, 0.2)
+    safety_rating = int(max(1, min(5, round(final_score))))
 
     # Geohash cell id
     grid_cell_id = encode_hash(lat, lng, 7)
@@ -109,7 +139,7 @@ for i in range(NUM_RATINGS):
         "safety_rating": safety_rating,
         "time_context":  str(hour),          # mirrors production column
         "created_at":    created_at.strftime("%Y-%m-%d %H:%M:%S"),
-        "tags":          ",".join(tags),
+        "tags":          ",".join(sampled_tags),
     })
 
 # ── Persist ───────────────────────────────────────────────────────────────────

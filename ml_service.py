@@ -45,7 +45,7 @@ FEAT_COLS_PATH   = RESOURCES_DIR / "feature_columns.pkl"
 RESOURCES_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-CSV_PATH        = "hervoice_ml_training_data.csv"
+CSV_PATH        = "hervoice_ml_training_data_12.csv"
 TARGET_COL      = "safety_rating"
 USE_GRID_SEARCH = False          # Set True to enable hyperparameter tuning
 FALLBACK_SCORE  = 3.0            # Returned when model is not ready
@@ -137,9 +137,9 @@ def _extract_temporal(series: pd.Series) -> pd.DataFrame:
     # Format matches HerVoice CSV: DD-MM-YYYY HH:MM:SS
     # e.g. "09-05-2026 20:54:47"
     dt = pd.to_datetime(series, format="%d-%m-%Y %H:%M:%S", errors="coerce")
-    # Fallback: if most values are NaT (wrong format), try inference
+    # Fallback: if most values are NaT (wrong format), try default inference
     if dt.isna().mean() > 0.5:
-        dt = pd.to_datetime(series, infer_datetime_format=True, errors="coerce")
+        dt = pd.to_datetime(series, errors="coerce")
     return pd.DataFrame(
         {
             "day_of_week": dt.dt.dayofweek.fillna(0).astype(int),
@@ -203,13 +203,16 @@ def build_features(
 def _build_base_model() -> XGBRegressor:
     return XGBRegressor(
         n_estimators=500,
-        max_depth=6,
+        max_depth=5,
         learning_rate=0.05,
         subsample=0.8,
-        colsample_bytree=0.8,
+        colsample_bytree=0.6,
+        min_child_weight=10,
+        reg_alpha=1.0,
+        reg_lambda=3.0,
         random_state=RANDOM_STATE,
-        tree_method="hist",   # ← add this
-        device="cuda",        # ← add this
+        tree_method="hist",
+        device="cuda",
         verbosity=0,
         n_jobs=-1,
     )
@@ -331,8 +334,12 @@ def train(csv_path: str = CSV_PATH) -> dict:
 
     Returns a metrics dict.
     """
-    logger.info("Loading dataset: %s", csv_path)
-    df = pd.read_csv(csv_path)
+    if isinstance(csv_path, pd.DataFrame):
+        logger.info("Training on passed DataFrame: %d rows", len(csv_path))
+        df = csv_path.copy()
+    else:
+        logger.info("Loading dataset: %s", csv_path)
+        df = pd.read_csv(csv_path)
     logger.info("Dataset shape: %s", df.shape)
     logger.info("Columns found: %s", df.columns.tolist())
 
